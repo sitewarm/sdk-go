@@ -83,6 +83,13 @@ func (e *ConnectionError) Error() string {
 }
 func (e *ConnectionError) Unwrap() error { return e.Err }
 
+// ResponseTooLargeError means the response body was larger than the SDK reads (32 MiB). Not retried.
+type ResponseTooLargeError struct{ Limit int }
+
+func (e *ResponseTooLargeError) Error() string {
+	return fmt.Sprintf("sitewarm: response body is larger than %d bytes", e.Limit)
+}
+
 // WaitTimeoutError is returned by WarmRuns.Wait; the run keeps going server side.
 type WaitTimeoutError struct {
 	RunID      string

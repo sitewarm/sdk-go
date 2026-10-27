@@ -3,6 +3,7 @@ package sitewarm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"iter"
 	"net/url"
 	"strconv"
@@ -10,6 +11,9 @@ import (
 
 	"github.com/sitewarm/sdk-go/models"
 )
+
+// maxPages bounds one Pages iteration; reaching it is reported as an error, not silently truncated.
+var maxPages = 10_000
 
 type listPage[T any] struct {
 	Data []T             `json:"data"`
@@ -20,7 +24,11 @@ type listPage[T any] struct {
 func Pages[T any](ctx context.Context, c *Client, operationID string, req Request) iter.Seq2[[]T, error] {
 	return func(yield func([]T, error) bool) {
 		cursor := req.Query.Get("cursor")
-		for n := 0; n < 10_000; n++ {
+		seen := map[string]struct{}{}
+		if cursor != "" {
+			seen[cursor] = struct{}{}
+		}
+		for n := 0; n < maxPages; n++ {
 			q := url.Values{}
 			for k, v := range req.Query {
 				q[k] = v
@@ -42,12 +50,14 @@ func Pages[T any](ctx context.Context, c *Client, operationID string, req Reques
 			if !page.Page.HasMore || next == nil || *next == "" {
 				return
 			}
-			if *next == cursor {
+			if _, dup := seen[*next]; dup {
 				yield(nil, errors.New("sitewarm: pagination cursor did not advance"))
 				return
 			}
+			seen[*next] = struct{}{}
 			cursor = *next
 		}
+		yield(nil, fmt.Errorf("sitewarm: pagination stopped after %d pages", maxPages))
 	}
 }
 
@@ -73,6 +83,14 @@ func Items[T any](ctx context.Context, c *Client, operationID string, req Reques
 type ListOptions struct {
 	Cursor string
 	Limit  int
+}
+
+// validate rejects a Limit outside the spec's 1..100 (0 means the server default).
+func (o ListOptions) validate() error {
+	if o.Limit < 0 || o.Limit > 100 {
+		return fmt.Errorf("sitewarm: Limit must be between 1 and 100 (0 for the default), got %d", o.Limit)
+	}
+	return nil
 }
 
 func (o ListOptions) query() url.Values {
@@ -103,6 +121,9 @@ func build(r Request, opts []CallOption) Request {
 type SitesService struct{ c *Client }
 
 func (s *SitesService) List(ctx context.Context, o ListOptions) (models.SiteList, error) {
+	if err := o.validate(); err != nil {
+		return models.SiteList{}, err
+	}
 	v, _, err := Call[models.SiteList](ctx, s.c, "listSites", Request{Query: o.query()})
 	return v, err
 }
@@ -167,16 +188,16 @@ func terminal(s models.RunStatus) bool {
 // Wait polls the run until it is completed, canceled or failed, honoring Retry-After. On timeout it returns
 // *WaitTimeoutError and does NOT cancel the run.
 func (s *WarmRunsService) Wait(ctx context.Context, runID string, w WaitOptions) (models.WarmRun, error) {
-	if w.Timeout == 0 {
+	if w.Timeout <= 0 {
 		w.Timeout = 15 * time.Minute
 	}
-	if w.PollInterval == 0 {
+	if w.PollInterval <= 0 {
 		w.PollInterval = 5 * time.Second
 	}
-	if w.MinPoll == 0 {
+	if w.MinPoll <= 0 {
 		w.MinPoll = time.Second
 	}
-	if w.MaxPoll == 0 {
+	if w.MaxPoll <= 0 {
 		w.MaxPoll = time.Minute
 	}
 	deadline := time.Now().Add(w.Timeout)

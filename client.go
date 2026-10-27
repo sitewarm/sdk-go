@@ -39,7 +39,7 @@ type operation struct {
 
 // Client talks to the API. It is safe for concurrent use.
 type Client struct {
-	apiKey      string
+	apiKey      *secret // pointer: fmt cannot reach into unexported fields, so a value would print raw
 	baseURL     string
 	http        *http.Client
 	maxRetries  int
@@ -57,19 +57,39 @@ type Client struct {
 // Option configures New.
 type Option func(*Client)
 
-// WithHTTPClient sets the HTTP client (default: a fresh client that never follows redirects).
-func WithHTTPClient(h *http.Client) Option { return func(c *Client) { c.http = h } }
+// WithHTTPClient sets the HTTP client (default: a fresh client). The client is copied and its CheckRedirect
+// replaced: redirects are never followed, whatever policy h had, so the key never goes to another origin.
+func WithHTTPClient(h *http.Client) Option {
+	return func(c *Client) {
+		if h != nil {
+			cp := *h
+			c.http = &cp
+		}
+	}
+}
 
 // WithMaxRetries sets the retries after the first attempt (default 3).
-func WithMaxRetries(n int) Option { return func(c *Client) { c.maxRetries = n } }
+func WithMaxRetries(n int) Option {
+	return func(c *Client) {
+		if n >= 0 {
+			c.maxRetries = n
+		}
+	}
+}
 
 // WithRetryDelays sets the backoff base (default 500ms) and the cap for one wait (default 30s).
 func WithRetryDelays(base, max time.Duration) Option {
 	return func(c *Client) { c.retryBase, c.retryMax = base, max }
 }
 
-// WithTimeout sets the per-attempt timeout (default 30s).
-func WithTimeout(d time.Duration) Option { return func(c *Client) { c.timeout = d } }
+// WithTimeout sets the per-attempt timeout (default 30s). A value <= 0 keeps the default.
+func WithTimeout(d time.Duration) Option {
+	return func(c *Client) {
+		if d > 0 {
+			c.timeout = d
+		}
+	}
+}
 
 // WithUserAgent overrides the User-Agent.
 func WithUserAgent(s string) Option { return func(c *Client) { c.userAgent = s } }
@@ -97,7 +117,7 @@ func New(apiKey, baseURL string, opts ...Option) (*Client, error) {
 		return nil, errors.New("sitewarm: baseURL must not contain a query or fragment")
 	}
 	c := &Client{
-		apiKey: apiKey, baseURL: u.Scheme + "://" + u.Host + strings.TrimRight(u.Path, "/"),
+		apiKey: newSecret(apiKey), baseURL: u.Scheme + "://" + u.Host + strings.TrimRight(u.Path, "/"),
 		maxRetries: 3, retryBase: 500 * time.Millisecond, retryMax: 30 * time.Second, timeout: 30 * time.Second,
 		userAgent: "sitewarm-go", sleep: sleepCtx,
 	}
@@ -105,8 +125,9 @@ func New(apiKey, baseURL string, opts ...Option) (*Client, error) {
 		o(c)
 	}
 	if c.http == nil {
-		c.http = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		c.http = &http.Client{}
 	}
+	c.http.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	c.Sites, c.Sitemaps, c.WarmRuns, c.CacheReport = &SitesService{c}, &SitemapsService{c}, &WarmRunsService{c}, &CacheStatusReportsService{c}
 	return c, nil
 }
@@ -163,8 +184,9 @@ func (c *Client) do(ctx context.Context, operationID string, req Request, out an
 	if sendsKey && key == "" {
 		key = newUUID() // one key per call, reused by every retry
 	}
-	// 429 = not processed. 5xx and network errors may have been, so retry them only when repeating is safe.
-	retryAmbiguous := op.method != http.MethodPost || sendsKey
+	// 429 = not processed. 5xx and network errors may have been, so retry them only when repeating is safe:
+	// a method that is safe to repeat, or a POST that carries an Idempotency-Key. DELETE and PATCH are not retried.
+	retryAmbiguous := repeatable(op.method) || sendsKey
 
 	for attempt := 0; ; attempt++ {
 		last := attempt >= c.maxRetries
@@ -179,15 +201,25 @@ func (c *Client) do(ctx context.Context, operationID string, req Request, out an
 				}
 				continue
 			}
-			ce := &ConnectionError{Err: scrub(err)}
-			var ne interface{ Timeout() bool }
-			ce.Timeout = errors.As(err, &ne) && ne.Timeout()
-			return nil, ce
+			return nil, connectionError(err)
 		}
-		data, rerr := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+		data, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 		resp.Body.Close()
 		if rerr != nil {
-			return nil, &ConnectionError{Err: scrub(rerr)}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			// A body that breaks off mid-read is as ambiguous as a network error, except after a 429.
+			if !last && (retryAmbiguous || resp.StatusCode == 429) {
+				if serr := c.sleep(ctx, c.backoff(attempt)); serr != nil {
+					return nil, serr
+				}
+				continue
+			}
+			return nil, connectionError(rerr)
+		}
+		if len(data) > maxBody {
+			return nil, &ResponseTooLargeError{Limit: maxBody}
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			if out != nil && len(bytes.TrimSpace(data)) > 0 && resp.StatusCode != http.StatusNoContent {
@@ -222,7 +254,7 @@ func (c *Client) attempt(ctx context.Context, method, u string, body []byte, key
 		cancel()
 		return nil, err
 	}
-	r.Header.Set("Authorization", "Bearer "+c.apiKey)
+	r.Header.Set("Authorization", "Bearer "+string(*c.apiKey))
 	r.Header.Set("Accept", "application/json, application/problem+json")
 	r.Header.Set("User-Agent", c.userAgent)
 	if body != nil {
@@ -246,6 +278,38 @@ type cancelBody struct {
 }
 
 func (b *cancelBody) Close() error { defer b.cancel(); return b.ReadCloser.Close() }
+
+// maxBody is the largest response body that is read (32 MiB).
+const maxBody = 32 << 20
+
+// secret keeps the API key out of fmt output (%v, %+v, %#v), JSON and text encodings.
+type secret string
+
+const redacted = "[redacted]"
+
+func (secret) String() string               { return redacted }
+func (secret) GoString() string             { return redacted }
+func (secret) Format(f fmt.State, _ rune)   { _, _ = io.WriteString(f, redacted) }
+func (secret) MarshalText() ([]byte, error) { return []byte(redacted), nil }
+func (secret) MarshalJSON() ([]byte, error) { return []byte(`"` + redacted + `"`), nil }
+
+func newSecret(s string) *secret { v := secret(s); return &v }
+
+// repeatable reports whether sending the method twice has the same effect as once.
+func repeatable(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPut, http.MethodOptions:
+		return true
+	}
+	return false
+}
+
+func connectionError(err error) *ConnectionError {
+	ce := &ConnectionError{Err: scrub(err)}
+	var ne interface{ Timeout() bool }
+	ce.Timeout = errors.As(err, &ne) && ne.Timeout()
+	return ce
+}
 
 // scrub drops the request URL/headers from transport errors so nothing sensitive is carried along.
 func scrub(err error) error {
