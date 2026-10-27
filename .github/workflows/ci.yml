@@ -9,6 +9,23 @@ permissions:
   contents: read
 
 jobs:
+  # oapi-codegen v2.8.1 needs Go 1.25+ to build; the SDK itself still supports Go 1.24 (go.mod), so only the
+  # generator runs on the newer toolchain.
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.25"
+      - name: Generated code is up to date
+        run: |
+          go generate ./...
+          git diff --exit-code -- models ops_gen.go
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -19,9 +36,5 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.24"
-      - name: Generated code is up to date
-        run: |
-          go generate ./...
-          git diff --exit-code -- models ops_gen.go
       - run: go vet ./...
       - run: go test ./... -race -count=1
