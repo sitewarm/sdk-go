@@ -104,10 +104,11 @@ func (o ListOptions) query() url.Values {
 	return q
 }
 
-// IdempotencyKey is an optional argument of create calls; a random key is used when omitted.
+// CallOption tunes one call, for example WithIdempotencyKey.
 type CallOption func(*Request)
 
-// WithIdempotencyKey sets the Idempotency-Key of a POST. Retries of the call reuse it.
+// WithIdempotencyKey sets the Idempotency-Key of a POST (1-255 printable ASCII characters). Retries of the
+// call reuse it. A random key is used when omitted.
 func WithIdempotencyKey(k string) CallOption { return func(r *Request) { r.IdempotencyKey = k } }
 
 func build(r Request, opts []CallOption) Request {
@@ -120,6 +121,7 @@ func build(r Request, opts []CallOption) Request {
 // SitesService: operations on sites.
 type SitesService struct{ c *Client }
 
+// List returns one page of sites.
 func (s *SitesService) List(ctx context.Context, o ListOptions) (models.SiteList, error) {
 	if err := o.validate(); err != nil {
 		return models.SiteList{}, err
@@ -127,13 +129,22 @@ func (s *SitesService) List(ctx context.Context, o ListOptions) (models.SiteList
 	v, _, err := Call[models.SiteList](ctx, s.c, "listSites", Request{Query: o.query()})
 	return v, err
 }
-func (s *SitesService) All(ctx context.Context) iter.Seq2[models.Site, error] {
-	return Items[models.Site](ctx, s.c, "listSites", Request{})
+
+// All iterates every site across pages, starting at o.Cursor and fetching o.Limit per page.
+func (s *SitesService) All(ctx context.Context, o ListOptions) iter.Seq2[models.Site, error] {
+	if err := o.validate(); err != nil {
+		return func(yield func(models.Site, error) bool) { yield(models.Site{}, err) }
+	}
+	return Items[models.Site](ctx, s.c, "listSites", Request{Query: o.query()})
 }
+
+// Get returns one site.
 func (s *SitesService) Get(ctx context.Context, siteID string) (models.Site, error) {
 	v, _, err := Call[models.Site](ctx, s.c, "getSite", Request{Path: map[string]string{"siteId": siteID}})
 	return v, err
 }
+
+// Create registers a site. A random Idempotency-Key is sent unless WithIdempotencyKey is given.
 func (s *SitesService) Create(ctx context.Context, body models.SiteCreate, opts ...CallOption) (models.Site, error) {
 	v, _, err := Call[models.Site](ctx, s.c, "createSite", build(Request{Body: body}, opts))
 	return v, err
@@ -142,6 +153,7 @@ func (s *SitesService) Create(ctx context.Context, body models.SiteCreate, opts 
 // SitemapsService: operations on sitemaps.
 type SitemapsService struct{ c *Client }
 
+// Create registers a sitemap for a site.
 func (s *SitemapsService) Create(ctx context.Context, siteID string, body models.SitemapCreate, opts ...CallOption) (models.Sitemap, error) {
 	v, _, err := Call[models.Sitemap](ctx, s.c, "createSitemap", build(Request{Path: map[string]string{"siteId": siteID}, Body: body}, opts))
 	return v, err
@@ -155,10 +167,14 @@ func (s *WarmRunsService) Create(ctx context.Context, siteID string, body models
 	v, _, err := Call[models.WarmRun](ctx, s.c, "createWarmRun", build(Request{Path: map[string]string{"siteId": siteID}, Body: body}, opts))
 	return v, err
 }
+
+// Get returns one warm run.
 func (s *WarmRunsService) Get(ctx context.Context, runID string) (models.WarmRun, error) {
 	v, _, err := Call[models.WarmRun](ctx, s.c, "getWarmRun", Request{Path: map[string]string{"runId": runID}})
 	return v, err
 }
+
+// Cancel asks the server to cancel a run; cancelling is asynchronous.
 func (s *WarmRunsService) Cancel(ctx context.Context, runID string, opts ...CallOption) (models.WarmRun, error) {
 	v, _, err := Call[models.WarmRun](ctx, s.c, "cancelWarmRun", build(Request{Path: map[string]string{"runId": runID}}, opts))
 	return v, err
@@ -240,6 +256,7 @@ func (s *WarmRunsService) Wait(ctx context.Context, runID string, w WaitOptions)
 // CacheStatusReportsService: cache status reports.
 type CacheStatusReportsService struct{ c *Client }
 
+// Get returns one cache status report.
 func (s *CacheStatusReportsService) Get(ctx context.Context, reportID string) (models.CacheStatusReport, error) {
 	v, _, err := Call[models.CacheStatusReport](ctx, s.c, "getCacheStatusReport", Request{Path: map[string]string{"reportId": reportID}})
 	return v, err

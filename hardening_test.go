@@ -126,7 +126,7 @@ func TestPaginationCursorCycleAndCap(t *testing.T) {
 		writeJSON(w, 200, fmt.Sprintf(`{"data":[{"id":"x"}],"page":{"has_more":true,"next_cursor":%q}}`, next))
 	})
 	var last error
-	for _, err := range c.Sites.All(context.Background()) {
+	for _, err := range c.Sites.All(context.Background(), ListOptions{}) {
 		last = err
 	}
 	if last == nil || !strings.Contains(last.Error(), "did not advance") {
@@ -142,7 +142,7 @@ func TestPaginationCursorCycleAndCap(t *testing.T) {
 		writeJSON(w, 200, fmt.Sprintf(`{"data":[],"page":{"has_more":true,"next_cursor":"c%d"}}`, n.Add(1)))
 	})
 	last = nil
-	for _, err := range endless.Sites.All(context.Background()) {
+	for _, err := range endless.Sites.All(context.Background(), ListOptions{}) {
 		last = err
 	}
 	if last == nil || !strings.Contains(last.Error(), "stopped after 5 pages") || n.Load() != 5 {

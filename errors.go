@@ -37,7 +37,8 @@ func (e *APIError) Error() string {
 	return s
 }
 
-// Sentinel errors for errors.Is. Every *APIError matches exactly one of them by status.
+// Sentinel errors for errors.Is. An *APIError matches the sentinel of its status (none for 3xx, 408, 413, 415 and
+// other statuses not listed here) and, for two problem types, a more specific one as well.
 var (
 	ErrAuthentication = errors.New("sitewarm: authentication failed (401)")
 	ErrPermission     = errors.New("sitewarm: permission denied (403)")
@@ -46,10 +47,21 @@ var (
 	ErrValidation     = errors.New("sitewarm: validation failed (400/422)")
 	ErrRateLimited    = errors.New("sitewarm: rate limited (429)")
 	ErrServer         = errors.New("sitewarm: server error (5xx)")
+
+	// ErrIdempotencyKeyReused is a 409 whose problem type is idempotency-key-reused (also matches ErrConflict).
+	ErrIdempotencyKeyReused = errors.New("sitewarm: idempotency key reused with a different request (409)")
+	// ErrQuotaExceeded is a 422 whose problem type is quota-exceeded (also matches ErrValidation).
+	ErrQuotaExceeded = errors.New("sitewarm: quota exceeded (422)")
 )
 
 // Is lets callers write errors.Is(err, sitewarm.ErrNotFound).
 func (e *APIError) Is(target error) bool {
+	if target == ErrIdempotencyKeyReused {
+		return e.Status == 409 && e.Code == "idempotency-key-reused"
+	}
+	if target == ErrQuotaExceeded {
+		return e.Status == 422 && e.Code == "quota-exceeded"
+	}
 	switch {
 	case e.Status == 401:
 		return target == ErrAuthentication
@@ -82,6 +94,17 @@ func (e *ConnectionError) Error() string {
 	return "sitewarm: request failed"
 }
 func (e *ConnectionError) Unwrap() error { return e.Err }
+
+// DecodeError means a 2xx response body was not the expected JSON (for example an HTML page from a proxy).
+type DecodeError struct {
+	Status int
+	Err    error
+}
+
+func (e *DecodeError) Error() string {
+	return fmt.Sprintf("sitewarm: invalid JSON in %d response", e.Status)
+}
+func (e *DecodeError) Unwrap() error { return e.Err }
 
 // ResponseTooLargeError means the response body was larger than the SDK reads (32 MiB). Not retried.
 type ResponseTooLargeError struct{ Limit int }

@@ -178,7 +178,7 @@ func TestItemsFollowsCursorAndDetectsStall(t *testing.T) {
 		writeJSON(w, 200, `{"data":[{"id":"c"}],"page":{"has_more":false,"next_cursor":null}}`)
 	})
 	var ids []string
-	for s, err := range c.Sites.All(context.Background()) {
+	for s, err := range c.Sites.All(context.Background(), ListOptions{}) {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -192,7 +192,7 @@ func TestItemsFollowsCursorAndDetectsStall(t *testing.T) {
 		writeJSON(w, 200, `{"data":[{"id":"a"}],"page":{"has_more":true,"next_cursor":"c1"}}`)
 	})
 	var last error
-	for _, err := range stuck.Sites.All(context.Background()) {
+	for _, err := range stuck.Sites.All(context.Background(), ListOptions{}) {
 		last = err
 	}
 	if last == nil || !strings.Contains(last.Error(), "did not advance") {

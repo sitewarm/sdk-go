@@ -8,12 +8,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	mrand "math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -24,17 +27,23 @@ import (
 	"github.com/sitewarm/sdk-go/models"
 )
 
-type idempotency int
+// IdempotencyMode says whether an operation takes an Idempotency-Key.
+type IdempotencyMode int
 
 const (
-	IdempotencyNone idempotency = iota
+	IdempotencyNone IdempotencyMode = iota
 	IdempotencyOptional
 	IdempotencyRequired
 )
 
+// Version is the SDK version, sent in the User-Agent.
+const Version = "0.1.0-preview"
+
+const defaultUserAgent = "sitewarm-go/" + Version + " (+https://github.com/sitewarm/sdk-go)"
+
 type operation struct {
 	method, path string
-	idempotency  idempotency
+	idempotency  IdempotencyMode
 }
 
 // Client talks to the API. It is safe for concurrent use.
@@ -91,8 +100,14 @@ func WithTimeout(d time.Duration) Option {
 	}
 }
 
-// WithUserAgent overrides the User-Agent.
-func WithUserAgent(s string) Option { return func(c *Client) { c.userAgent = s } }
+// WithUserAgent overrides the User-Agent. An empty string keeps the default.
+func WithUserAgent(s string) Option {
+	return func(c *Client) {
+		if s != "" {
+			c.userAgent = s
+		}
+	}
+}
 
 var keyRE = regexp.MustCompile(`^[\x21-\x7e]+$`)
 
@@ -117,9 +132,9 @@ func New(apiKey, baseURL string, opts ...Option) (*Client, error) {
 		return nil, errors.New("sitewarm: baseURL must not contain a query or fragment")
 	}
 	c := &Client{
-		apiKey: newSecret(apiKey), baseURL: u.Scheme + "://" + u.Host + strings.TrimRight(u.Path, "/"),
+		apiKey: newSecret(apiKey), baseURL: u.Scheme + "://" + u.Host + strings.TrimRight(u.EscapedPath(), "/"),
 		maxRetries: 3, retryBase: 500 * time.Millisecond, retryMax: 30 * time.Second, timeout: 30 * time.Second,
-		userAgent: "sitewarm-go", sleep: sleepCtx,
+		userAgent: defaultUserAgent, sleep: sleepCtx,
 	}
 	for _, o := range opts {
 		o(c)
@@ -181,6 +196,14 @@ func (c *Client) do(ctx context.Context, operationID string, req Request, out an
 	}
 	sendsKey := op.idempotency != IdempotencyNone && op.method == http.MethodPost
 	key := req.IdempotencyKey
+	if key != "" {
+		if !sendsKey {
+			return nil, fmt.Errorf("sitewarm: operation %q does not accept an Idempotency-Key", operationID)
+		}
+		if len(key) > 255 || !keyRE.MatchString(key) {
+			return nil, errors.New("sitewarm: IdempotencyKey must be 1-255 printable ASCII characters without whitespace")
+		}
+	}
 	if sendsKey && key == "" {
 		key = newUUID() // one key per call, reused by every retry
 	}
@@ -195,7 +218,7 @@ func (c *Client) do(ctx context.Context, operationID string, req Request, out an
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			if !last && retryAmbiguous {
+			if !last && retryAmbiguous && transient(err) {
 				if serr := c.sleep(ctx, c.backoff(attempt)); serr != nil {
 					return nil, serr
 				}
@@ -224,26 +247,36 @@ func (c *Client) do(ctx context.Context, operationID string, req Request, out an
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			if out != nil && len(bytes.TrimSpace(data)) > 0 && resp.StatusCode != http.StatusNoContent {
 				if jerr := json.Unmarshal(data, out); jerr != nil {
-					return nil, fmt.Errorf("sitewarm: invalid JSON in %d response", resp.StatusCode)
+					return nil, &DecodeError{Status: resp.StatusCode, Err: jerr}
 				}
 			}
 			return &Response{Status: resp.StatusCode, Header: resp.Header}, nil
 		}
 		retryAfter, hasRA := parseRetryAfter(resp.Header.Get("Retry-After"))
+		aerr := apiError(resp.StatusCode, data, retryAfter, resp.Header)
 		retryable := resp.StatusCode == 429 || (resp.StatusCode >= 500 && resp.StatusCode != 501 && retryAmbiguous)
+		// A 409 "conflict" on a keyed POST is the original request still running (a timeout retry racing it).
+		// "idempotency-key-reused" is a caller bug and never retried.
+		if resp.StatusCode == 409 && sendsKey && aerr.Code == "conflict" {
+			retryable = true
+		}
 		if retryable && !last {
 			wait := c.backoff(attempt)
 			if hasRA {
-				wait = retryAfter
+				// Never a hot retry on "Retry-After: 0" or a date in the past; jitter spreads clients out.
+				wait = max(retryAfter, c.retryBase)
+				if wait <= c.retryMax { // a longer server-provided wait is surfaced, not ignored
+					wait += time.Duration(mrand.Float64() * float64(wait) / 4)
+				}
 			}
-			if wait <= c.retryMax { // a longer server-provided wait is surfaced, not ignored
+			if wait <= c.retryMax || (hasRA && max(retryAfter, c.retryBase) <= c.retryMax) {
 				if serr := c.sleep(ctx, wait); serr != nil {
 					return nil, serr
 				}
 				continue
 			}
 		}
-		return nil, apiError(resp.StatusCode, data, retryAfter, resp.Header)
+		return nil, aerr
 	}
 }
 
@@ -252,7 +285,7 @@ func (c *Client) attempt(ctx context.Context, method, u string, body []byte, key
 	r, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
 	if err != nil {
 		cancel()
-		return nil, err
+		return nil, &permanentError{err}
 	}
 	r.Header.Set("Authorization", "Bearer "+string(*c.apiKey))
 	r.Header.Set("Accept", "application/json, application/problem+json")
@@ -302,6 +335,31 @@ func repeatable(method string) bool {
 		return true
 	}
 	return false
+}
+
+// permanentError marks a failure that repeating cannot fix.
+type permanentError struct{ error }
+
+func (e *permanentError) Unwrap() error { return e.error }
+
+// transient reports whether a transport error may go away on a retry. Certificate failures, unknown hosts and
+// malformed requests do not.
+func transient(err error) bool {
+	var perm *permanentError
+	var unknownAuth x509.UnknownAuthorityError
+	var certInvalid x509.CertificateInvalidError
+	var hostErr x509.HostnameError
+	var verify *tls.CertificateVerificationError
+	var dns *net.DNSError
+	var addr *net.AddrError
+	switch {
+	case errors.As(err, &perm), errors.As(err, &unknownAuth), errors.As(err, &certInvalid), errors.As(err, &hostErr),
+		errors.As(err, &verify), errors.As(err, &addr):
+		return false
+	case errors.As(err, &dns):
+		return !dns.IsNotFound
+	}
+	return !strings.Contains(err.Error(), "invalid header field")
 }
 
 func connectionError(err error) *ConnectionError {
@@ -381,17 +439,22 @@ func apiError(status int, body []byte, retryAfter time.Duration, h http.Header) 
 var pathParamRE = regexp.MustCompile(`\{(\w+)\}`)
 
 func expandPath(tmpl string, values map[string]string) (string, error) {
-	var missing string
+	var missing, bad string
 	out := pathParamRE.ReplaceAllStringFunc(tmpl, func(m string) string {
 		name := m[1 : len(m)-1]
 		v := values[name]
 		if v == "" {
 			missing = name
+		} else if v == "." || v == ".." {
+			bad = name
 		}
 		return url.PathEscape(v)
 	})
 	if missing != "" {
 		return "", fmt.Errorf("sitewarm: missing path parameter %q", missing)
+	}
+	if bad != "" {
+		return "", fmt.Errorf("sitewarm: invalid path parameter %q", bad)
 	}
 	return out, nil
 }
